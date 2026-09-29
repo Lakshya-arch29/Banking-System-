@@ -14,14 +14,20 @@ export function setAuthToken(token: string | null): void {
   }
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(
+  path: string,
+  options?: RequestInit,
+): Promise<T> {
   const token = getAuthToken()
+
   const headers: Record<string, string> = {
     Accept: 'application/json',
     ...(options?.body instanceof FormData
       ? {}
       : { 'Content-Type': 'application/json' }),
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(token
+      ? { Authorization: `Bearer ${token}` }
+      : {}),
     ...(options?.headers as Record<string, string> | undefined),
   }
 
@@ -32,6 +38,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     let detail = response.statusText
+
     try {
       const body = await response.json()
       detail =
@@ -39,15 +46,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
           ? body.detail
           : JSON.stringify(body.detail ?? body)
     } catch {
-      // ignore parse errors
+      // The response was not JSON.
     }
 
-    if (response.status === 401 && !path.startsWith('/api/auth/login')) {
-      // Clean invalid or expired token
+    if (
+      response.status === 401
+      && !path.startsWith('/api/auth/login')
+    ) {
       setAuthToken(null)
     }
 
-    throw new Error(detail || `Request failed (${response.status})`)
+    throw new Error(
+      detail || `Request failed (${response.status})`,
+    )
   }
 
   if (response.status === 204) {
@@ -57,7 +68,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export type UserRole = 'admin' | 'data_steward' | 'reviewer' | 'auditor' | string
+
+export type UserRole =
+  | 'admin'
+  | 'data_steward'
+  | 'reviewer'
+  | 'auditor'
+  | string
 
 export type User = {
   id: number
@@ -115,6 +132,33 @@ export type CriticalCheck = {
   reason: string
 }
 
+export type CandidateExplanation = {
+  decision?: string
+  gate_status?: string
+  summary?: string
+  best_score?: number | null
+  second_best_score?: number | null
+  score_margin?: number | null
+  evaluated_members_count?: number
+  critical_checks?: CriticalCheck[]
+  [key: string]: unknown
+}
+
+/*
+ * This is the shape used internally by the existing React components.
+ *
+ * The backend now stores flat fields:
+ *   ai_decision
+ *   final_score
+ *   text_similarity
+ *   semantic_similarity
+ *   specification_similarity
+ *   material_grade_similarity
+ *   other_attributes_similarity
+ *
+ * normalizeCandidate() below converts the backend response into this
+ * UI shape so existing review components continue to work safely.
+ */
 export type Candidate = {
   id: number
   source_material_id: number
@@ -125,23 +169,104 @@ export type Candidate = {
   target_code: string
   source_description: string
   target_description: string
+
   scores: MatchScores
   critical_checks: CriticalCheck[]
-  engine_decision: 'HIGH_CONFIDENCE' | 'REVIEW' | 'DIFFERENT'
+
+  engine_decision:
+    | 'HIGH_CONFIDENCE'
+    | 'REVIEW'
+    | 'DIFFERENT'
+
   review_status: string
   reviewer_id?: string | null
   reviewer_comments?: string | null
   reviewed_at?: string | null
   created_at?: string
-  explanation?: {
-    type?: string
-    cnmc_code?: string
-    canonical_score?: number
-    best_score?: number | null
-    second_best_score?: number | null
-    score_margin?: number | null
-    evaluated_members_count?: number
-    [key: string]: unknown
+
+  explanation?: CandidateExplanation
+}
+
+type BackendCandidate = {
+  id: number
+  source_material_id: number
+  target_material_id: number
+  source_cpse: string
+  target_cpse: string
+  source_code: string
+  target_code: string
+  source_description: string
+  target_description: string
+
+  text_similarity?: number | null
+  semantic_similarity?: number | null
+  specification_similarity?: number | null
+  material_grade_similarity?: number | null
+  other_attributes_similarity?: number | null
+  final_score?: number | null
+
+  gate_status?: string | null
+  ai_decision?: 'HIGH_CONFIDENCE' | 'REVIEW' | 'DIFFERENT'
+  review_status: string
+  critical_checks?: CriticalCheck[]
+  explanation?: CandidateExplanation
+
+  reviewer_id?: string | null
+  reviewer_comments?: string | null
+  reviewed_at?: string | null
+  created_at?: string
+}
+
+function normalizeCandidate(
+  candidate: BackendCandidate,
+): Candidate {
+  const finalScore = Number(
+    candidate.final_score ?? 0,
+  )
+
+  return {
+    id: candidate.id,
+    source_material_id: candidate.source_material_id,
+    target_material_id: candidate.target_material_id,
+    source_cpse: candidate.source_cpse,
+    target_cpse: candidate.target_cpse,
+    source_code: candidate.source_code,
+    target_code: candidate.target_code,
+    source_description: candidate.source_description,
+    target_description: candidate.target_description,
+
+    scores: {
+      text_similarity: Number(
+        candidate.text_similarity ?? 0,
+      ),
+      semantic_similarity: Number(
+        candidate.semantic_similarity ?? 0,
+      ),
+      specification_similarity: Number(
+        candidate.specification_similarity ?? 0,
+      ),
+      material_grade_similarity: Number(
+        candidate.material_grade_similarity ?? 0,
+      ),
+      other_attributes_similarity: Number(
+        candidate.other_attributes_similarity ?? 0,
+      ),
+      final_score: finalScore,
+    },
+
+    critical_checks: candidate.critical_checks ?? [],
+    engine_decision:
+      candidate.ai_decision ?? 'REVIEW',
+    review_status: candidate.review_status,
+    reviewer_id: candidate.reviewer_id,
+    reviewer_comments: candidate.reviewer_comments,
+    reviewed_at: candidate.reviewed_at,
+    created_at: candidate.created_at,
+
+    explanation: {
+      ...(candidate.explanation ?? {}),
+      gate_status: candidate.gate_status ?? 'UNKNOWN',
+    },
   }
 }
 
@@ -150,10 +275,16 @@ export type AnalyticsOverview = {
   cpse_count: number
   total_candidate_pairs: number
   high_confidence: number
+  review_recommendations?: number
   review_pending: number
   approved: number
   rejected: number
   automation_rate: number | null
+  gate_breakdown?: {
+    pass: number
+    unknown: number
+    conflict: number
+  }
 }
 
 export type CpseBreakdown = {
@@ -195,7 +326,6 @@ export type DataQualityMetrics = {
   completeness_score: number
   by_cpse_quality: CpseDataQuality[]
 }
-
 
 export type AuditEvent = {
   event_type: string
@@ -250,34 +380,58 @@ export type Mapping = {
   created_at: string
 }
 
+
 export const api = {
-  // Auth endpoints
-  login: (credentials: { email: string; password: string }) =>
+  login: (
+    credentials: {
+      email: string
+      password: string
+    },
+  ) =>
     request<TokenResponse>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify(credentials),
     }),
 
-  getMe: () => request<User>('/api/auth/me'),
+  getMe: () =>
+    request<User>('/api/auth/me'),
 
   refresh: (token: string) =>
     request<TokenResponse>('/api/auth/refresh', {
       method: 'POST',
-      body: JSON.stringify({ access_token: token }),
+      body: JSON.stringify({
+        access_token: token,
+      }),
     }),
 
   logout: () =>
-    request<{ message: string; user_id: number }>('/api/auth/logout', {
+    request<{
+      message: string
+      user_id: number
+    }>('/api/auth/logout', {
       method: 'POST',
     }),
 
-  // User management (Admin)
-  listUsers: (page = 1, pageSize = 50, role?: string) => {
-    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
-    if (role && role !== 'all') params.set('role', role)
-    return request<{ items: User[]; total: number; page: number; page_size: number }>(
-      `/api/users?${params.toString()}`,
-    )
+  listUsers: (
+    page = 1,
+    pageSize = 50,
+    role?: string,
+  ) => {
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    })
+
+    if (role && role !== 'all') {
+      params.set('role', role)
+    }
+
+    return request<{
+      items: User[]
+      total: number
+      page: number
+      page_size: number
+    }>(`/api/users?${params.toString()}`)
   },
 
   createUser: (payload: {
@@ -292,7 +446,8 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  getUser: (id: number) => request<User>(`/api/users/${id}`),
+  getUser: (id: number) =>
+    request<User>(`/api/users/${id}`),
 
   updateUser: (
     id: number,
@@ -314,18 +469,28 @@ export const api = {
       method: 'DELETE',
     }),
 
-  listCpses: () => request<CpseOption[]>('/api/users/cpses'),
+  listCpses: () =>
+    request<CpseOption[]>('/api/users/cpses'),
 
-  // Core endpoints
-  health: () => request<{ status: string; service: string }>('/health'),
+  health: () =>
+    request<{
+      status: string
+      service: string
+    }>('/health'),
 
   uploadMaterials: (file: File) => {
     const formData = new FormData()
     formData.append('file', file)
+
     return request<{
       status: string
       records_ingested: number
       total_materials: number
+      milvus?: {
+        status: string
+        embeddings_requested: number
+        error?: string | null
+      }
     }>('/api/materials/upload', {
       method: 'POST',
       body: formData,
@@ -340,18 +505,37 @@ export const api = {
     limit?: number
   }) => {
     const search = new URLSearchParams()
-    if (params?.query) search.set('query', params.query)
-    if (params?.cpse) search.set('cpse', params.cpse)
-    if (params?.category) search.set('category', params.category)
-    if (params?.skip != null) search.set('skip', String(params.skip))
-    if (params?.limit != null) search.set('limit', String(params.limit))
-    const qs = search.toString()
+
+    if (params?.query) {
+      search.set('query', params.query)
+    }
+
+    if (params?.cpse) {
+      search.set('cpse', params.cpse)
+    }
+
+    if (params?.category) {
+      search.set('category', params.category)
+    }
+
+    if (params?.skip != null) {
+      search.set('skip', String(params.skip))
+    }
+
+    if (params?.limit != null) {
+      search.set('limit', String(params.limit))
+    }
+
+    const query = search.toString()
+
     return request<{
       total: number
       skip: number
       limit: number
       materials: Material[]
-    }>(`/api/materials${qs ? `?${qs}` : ''}`)
+    }>(
+      `/api/materials${query ? `?${query}` : ''}`,
+    )
   },
 
   materialsStats: () =>
@@ -359,7 +543,10 @@ export const api = {
       total_materials: number
       cpse_count: number
       cpse_list: string[]
-      category_distribution: Record<string, number>
+      category_distribution: Record<
+        string,
+        number
+      >
     }>('/api/materials/stats'),
 
   runBatchMatching: (overwrite = false) =>
@@ -369,11 +556,20 @@ export const api = {
       candidate_pairs_evaluated: number
       new_candidates_stored: number
       total_candidates: number
-      decision_breakdown: Record<string, number>
+      decision_breakdown: Record<
+        string,
+        number
+      >
+      gate_breakdown?: Record<string, number>
+      vector_search_hits?: number
+      vector_search_failures?: number
       elapsed_ms: number
     }>('/api/matching/run-batch', {
       method: 'POST',
-      body: JSON.stringify({ overwrite, max_candidates_per_material: 50 }),
+      body: JSON.stringify({
+        overwrite,
+        max_candidates_per_material: 15,
+      }),
     }),
 
   reviewQueue: (skip = 0, limit = 100) =>
@@ -381,16 +577,23 @@ export const api = {
       total_pending: number
       skip: number
       limit: number
-      queue: Candidate[]
-    }>(`/api/review/queue?skip=${skip}&limit=${limit}`),
+      queue: BackendCandidate[]
+    }>(
+      `/api/review/queue?skip=${skip}&limit=${limit}`,
+    ).then((response) => ({
+      ...response,
+      queue: response.queue.map(normalizeCandidate),
+    })),
 
   reviewSummary: () =>
     request<{
       total_review_queue: number
+      total_reviewable?: number
       pending: number
       approved: number
       rejected: number
       high_confidence: number
+      review_recommendations?: number
     }>('/api/review/summary'),
 
   reviewAction: (
@@ -398,7 +601,10 @@ export const api = {
     action: 'APPROVE' | 'REJECT',
     comments?: string,
   ) =>
-    request<{ status: string; candidate: Candidate }>(
+    request<{
+      status: string
+      candidate: BackendCandidate
+    }>(
       `/api/review/queue/${candidateId}/action`,
       {
         method: 'POST',
@@ -407,30 +613,44 @@ export const api = {
           reviewer_comments: comments ?? null,
         }),
       },
-    ),
+    ).then((response) => ({
+      ...response,
+      candidate: normalizeCandidate(
+        response.candidate,
+      ),
+    })),
 
   analyticsOverview: () =>
-    request<AnalyticsOverview>('/api/analytics/overview'),
+    request<AnalyticsOverview>(
+      '/api/analytics/overview',
+    ),
 
   analyticsByCpse: () =>
-    request<{ cpse_breakdown: CpseBreakdown[] }>('/api/analytics/by-cpse'),
+    request<{
+      cpse_breakdown: CpseBreakdown[]
+    }>('/api/analytics/by-cpse'),
 
   analyticsCategories: () =>
-    request<{ category_distribution: CategoryDistribution[] }>(
-      '/api/analytics/categories',
-    ),
+    request<{
+      category_distribution: CategoryDistribution[]
+    }>('/api/analytics/categories'),
 
   analyticsScores: () =>
-    request<{ total_candidates: number; score_histogram: ScoreBucket[] }>(
-      '/api/analytics/scores',
-    ),
+    request<{
+      total_candidates: number
+      score_histogram: ScoreBucket[]
+    }>('/api/analytics/scores'),
 
   analyticsDataQuality: () =>
-    request<DataQualityMetrics>('/api/analytics/data-quality'),
-
+    request<DataQualityMetrics>(
+      '/api/analytics/data-quality',
+    ),
 
   listMappings: () =>
-    request<{ total: number; mappings: Mapping[] }>('/api/mappings'),
+    request<{
+      total: number
+      mappings: Mapping[]
+    }>('/api/mappings'),
 
   generateMappings: () =>
     request<{
@@ -439,14 +659,21 @@ export const api = {
       total_mappings: number
       mappings: Mapping[]
       message?: string
-    }>('/api/mappings/generate', { method: 'POST' }),
+    }>('/api/mappings/generate', {
+      method: 'POST',
+    }),
 
   approveMapping: (mappingId: number) =>
     request<{
       status: string
       mapping: Mapping
       message?: string
-    }>(`/api/mappings/${mappingId}/approve`, { method: 'POST' }),
+    }>(
+      `/api/mappings/${mappingId}/approve`,
+      {
+        method: 'POST',
+      },
+    ),
 
   exportMappingsFlat: () =>
     request<{
@@ -463,12 +690,18 @@ export const api = {
     }>('/api/mappings/export/flat'),
 
   listAudit: (skip = 0, limit = 100) =>
-    request<{ total: number; events: AuditEvent[] }>(
+    request<{
+      total: number
+      events: AuditEvent[]
+    }>(
       `/api/audit?skip=${skip}&limit=${limit}`,
     ),
 
   exportAudit: () =>
-    request<{ total: number; events: AuditEvent[] }>('/api/audit/export'),
+    request<{
+      total: number
+      events: AuditEvent[]
+    }>('/api/audit/export'),
 
   findCnmcCandidates: (material: {
     id?: number
@@ -494,7 +727,10 @@ export const api = {
         standardized_description: string
         scores: MatchScores
         critical_checks: CriticalCheck[]
-        engine_decision: 'HIGH_CONFIDENCE' | 'REVIEW' | 'DIFFERENT'
+        engine_decision:
+          | 'HIGH_CONFIDENCE'
+          | 'REVIEW'
+          | 'DIFFERENT'
         final_score: number
         canonical_score: number
         strongest_member_score?: number | null
@@ -508,48 +744,74 @@ export const api = {
       body: JSON.stringify({ material }),
     }),
 
-  runCnmcBatchMatching: (maxCandidatesPerMaterial = 5, minScore = 0.65) =>
+  runCnmcBatchMatching: (
+    maxCandidatesPerMaterial = 5,
+    minScore = 0.65,
+  ) =>
     request<{
       status: string
       materials_evaluated: number
       proposals_generated: number
-      proposals: any[]
+      proposals: unknown[]
     }>('/api/matching/cnmc/run-batch', {
       method: 'POST',
       body: JSON.stringify({
-        max_candidates_per_material: maxCandidatesPerMaterial,
+        max_candidates_per_material:
+          maxCandidatesPerMaterial,
         min_score: minScore,
         create_review_candidates: true,
       }),
     }),
 
-  attachMaterialToMapping: (mappingId: number, materialId: number) =>
-    request<{ status: string; mapping: Mapping }>(
+  attachMaterialToMapping: (
+    mappingId: number,
+    materialId: number,
+  ) =>
+    request<{
+      status: string
+      mapping: Mapping
+    }>(
       `/api/mappings/${mappingId}/attach`,
       {
         method: 'POST',
-        body: JSON.stringify({ material_id: materialId }),
+        body: JSON.stringify({
+          material_id: materialId,
+        }),
       },
     ),
 }
 
 
-export function formatPercent(value: number, digits = 0): string {
+export function formatPercent(
+  value: number,
+  digits = 0,
+): string {
   return `${(value * 100).toFixed(digits)}%`
 }
 
-export function formatNumber(value: number): string {
+export function formatNumber(
+  value: number,
+): string {
   return value.toLocaleString()
 }
 
-export function formatTimestamp(iso: string): string {
+export function formatTimestamp(
+  iso: string,
+): string {
   const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) return iso
-  return date.toLocaleString(undefined, {
-    day: '2-digit',
-    month: 'short',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
+
+  if (Number.isNaN(date.getTime())) {
+    return iso
+  }
+
+  return date.toLocaleString(
+    undefined,
+    {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    },
+  )
 }

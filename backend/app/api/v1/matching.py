@@ -1,13 +1,3 @@
-"""
-Matching routes.
-
-POST /api/matching/compare   — single pair comparison (existing, unchanged)
-POST /api/matching/run-batch — dataset-level: block → score → classify all
-GET  /api/matching/candidates — list generated candidates with filters
-GET  /api/matching/candidates/{id} — single candidate detail
-GET  /api/matching/stats     — blocking / recall / score summary stats
-"""
-
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,17 +19,21 @@ from app.services.matching.cnmc_matcher import (
     find_cnmc_candidates_for_material,
     match_new_materials_against_cnmcs,
 )
-from app.services.matching.embeddings import EmbeddingCache, precompute_embeddings
-from app.services.matching.vector_search import search_similar_materials
-from app.services.normalization.service import normalize_material_description
+from app.services.matching.embeddings import EmbeddingCache
+from app.services.matching.vector_search import (
+    search_similar_materials,
+)
+from app.services.normalization.service import (
+    normalize_material_description,
+)
 from app.services.parsing.service import parse_specifications
 
-router = APIRouter(prefix="/matching", tags=["Matching"])
 
+router = APIRouter(
+    prefix="/matching",
+    tags=["Matching"],
+)
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
 
 class MaterialInput(BaseModel):
     id: int | None = None
@@ -65,23 +59,13 @@ class CompareRequest(BaseModel):
 
 class BatchRunRequest(BaseModel):
     max_candidates_per_material: int = Field(
-        default=50,
+        default=15,
         ge=1,
         le=500,
-        description="Cap on blocking output per source material to control runtime.",
     )
-    overwrite: bool = Field(
-        default=False,
-        description="If True, clear existing candidates before running.",
-    )
-    source_cpse: str | None = Field(
-        default=None,
-        description="Optional filter to only process source materials from this CPSE.",
-    )
-    target_cpse: str | None = Field(
-        default=None,
-        description="Optional filter to only match against candidate materials from this CPSE.",
-    )
+    overwrite: bool = False
+    source_cpse: str | None = None
+    target_cpse: str | None = None
 
 
 class CnmcMatchRequest(BaseModel):
@@ -91,384 +75,579 @@ class CnmcMatchRequest(BaseModel):
 
 
 class CnmcBatchRunRequest(BaseModel):
-    max_candidates_per_material: int = Field(default=5, ge=1, le=50)
+    max_candidates_per_material: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+    )
     min_score: float = Field(default=0.65, ge=0.0, le=1.0)
-    create_review_candidates: bool = Field(default=True)
+    create_review_candidates: bool = True
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _prepare_material(material: MaterialInput) -> dict[str, Any]:
     data = material.model_dump()
+
     data["normalized_description"] = (
         data.get("normalized_description")
-        or normalize_material_description(data["description"])
+        or normalize_material_description(
+            data["description"]
+        )
     )
+
     data["parsed_specifications"] = (
         data.get("parsed_specifications")
         or parse_specifications(data["description"])
     )
+
     if not data.get("dimensions"):
-        data["dimensions"] = data["parsed_specifications"].get("dimensions")
+        data["dimensions"] = data[
+            "parsed_specifications"
+        ].get("dimensions")
+
+    if data.get("other_attributes") is None:
+        data["other_attributes"] = {}
+
     return data
 
 
-def _store_material_to_blocker(m: dict[str, Any]) -> MaterialForBlocking:
+def _blocker(material: dict[str, Any]) -> MaterialForBlocking:
     return MaterialForBlocking(
-        id=m["id"],
-        category=m.get("category"),
-        normalized_description=m.get("normalized_description") or m["description"],
-        material_grade=m.get("material_grade"),
-        manufacturer_part_number=m.get("manufacturer_part_number"),
+        id=material["id"],
+        category=material.get("category"),
+        normalized_description=(
+            material.get("normalized_description")
+            or material["description"]
+        ),
+        material_grade=material.get("material_grade"),
+        manufacturer_part_number=material.get(
+            "manufacturer_part_number"
+        ),
     )
 
 
-def _pair_key(a: int, b: int) -> tuple[int, int]:
-    """Canonical unordered pair key — avoids A-B and B-A duplicates."""
-    return (min(a, b), max(a, b))
+def _pair_key(first: int, second: int) -> tuple[int, int]:
+    return min(first, second), max(first, second)
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+def _gate_status(checks: list[dict[str, Any]]) -> str:
+    statuses = {
+        str(item.get("status", "UNKNOWN")).upper()
+        for item in checks
+    }
+
+    if "CONFLICT" in statuses:
+        return "CONFLICT"
+
+    if "UNKNOWN" in statuses:
+        return "UNKNOWN"
+
+    return "PASS"
+
+
+def _explanation(
+    decision: str,
+    gate_status: str,
+    scores: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "decision": decision,
+        "gate_status": gate_status,
+        "scores": scores,
+        "critical_checks": checks,
+        "summary": (
+            "All applicable technical gates passed."
+            if gate_status == "PASS"
+            else "Human review is required."
+        ),
+    }
+
+
+def _candidate(
+    source: dict[str, Any],
+    target: dict[str, Any],
+    result: dict[str, Any],
+    candidate_id: int,
+    created_at: str,
+) -> dict[str, Any]:
+    scores = result["scores"]
+    checks = result["critical_checks"]
+    decision = str(result["decision"]).upper()
+    gate_status = _gate_status(checks)
+
+    return {
+        "id": candidate_id,
+        "source_material_id": source["id"],
+        "target_material_id": target["id"],
+        "source_cpse": source.get("cpse"),
+        "target_cpse": target.get("cpse"),
+        "source_code": source.get("material_code"),
+        "target_code": target.get("material_code"),
+        "source_description": source.get("description"),
+        "target_description": target.get("description"),
+        "text_similarity": scores.get(
+            "text_similarity",
+            0.0,
+        ),
+        "semantic_similarity": scores.get(
+            "semantic_similarity",
+            0.0,
+        ),
+        "specification_similarity": scores.get(
+            "specification_similarity",
+            0.0,
+        ),
+        "material_grade_similarity": scores.get(
+            "material_grade_similarity",
+            0.0,
+        ),
+        "other_attributes_similarity": scores.get(
+            "other_attributes_similarity",
+            0.0,
+        ),
+        "final_score": scores.get(
+            "final_score",
+            0.0,
+        ),
+        "gate_status": gate_status,
+        "ai_decision": decision,
+        "review_status": "PENDING",
+        "critical_checks": checks,
+        "explanation": _explanation(
+            decision,
+            gate_status,
+            scores,
+            checks,
+        ),
+        "reviewer_id": None,
+        "reviewer_comments": None,
+        "reviewed_at": None,
+        "created_at": created_at,
+    }
+
 
 @router.post("/compare")
 def compare_materials(
     request: CompareRequest,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(
+        get_current_active_user
+    ),
 ):
-    """Score and classify a single candidate material pair."""
     source = _prepare_material(request.source)
     target = _prepare_material(request.target)
     result = classify_match(source, target)
+
+    scores = result["scores"]
+    checks = result["critical_checks"]
+    decision = str(result["decision"]).upper()
+    gate_status = _gate_status(checks)
+
     return {
         "source_material_id": source.get("id"),
         "target_material_id": target.get("id"),
-        **result,
+        "text_similarity": scores.get(
+            "text_similarity",
+            0.0,
+        ),
+        "semantic_similarity": scores.get(
+            "semantic_similarity",
+            0.0,
+        ),
+        "specification_similarity": scores.get(
+            "specification_similarity",
+            0.0,
+        ),
+        "material_grade_similarity": scores.get(
+            "material_grade_similarity",
+            0.0,
+        ),
+        "other_attributes_similarity": scores.get(
+            "other_attributes_similarity",
+            0.0,
+        ),
+        "final_score": scores.get(
+            "final_score",
+            0.0,
+        ),
+        "gate_status": gate_status,
+        "ai_decision": decision,
+        "critical_checks": checks,
+        "explanation": _explanation(
+            decision,
+            gate_status,
+            scores,
+            checks,
+        ),
     }
 
 
 @router.post("/run-batch")
 def run_batch_matching(
     request: BatchRunRequest,
-    current_user: User = Depends(require_permission("run_matching")),
+    current_user: User = Depends(
+        require_permission("run_matching")
+    ),
 ):
-    """
-    Dataset-level matching.
-
-    1. Convert all ingested materials to blocker objects.
-    2. Build the block index (key → list of material IDs).
-    3. For each material generate cross-CPSE candidates via blocking.
-    4. Score and classify each unique candidate pair.
-    5. Store results in the shared CANDIDATES store.
-
-    Returns a summary: pairs evaluated, decisions breakdown, timing.
-    """
     if not store.MATERIALS:
         raise HTTPException(
             status_code=400,
-            detail="No materials ingested. Upload a CSV via POST /api/materials/upload first.",
+            detail="No materials ingested.",
         )
 
     if request.overwrite:
         store.CANDIDATES.clear()
 
-    started_at = datetime.now(timezone.utc)
+    started = datetime.now(timezone.utc)
+    created_at = started.isoformat()
+    materials = list(store.MATERIALS)
 
-    # --- Build blocker objects & index maps ---
-    blocker_objects = [_store_material_to_blocker(m) for m in store.MATERIALS]
-    material_index: dict[int, dict[str, Any]] = {m["id"]: m for m in store.MATERIALS}
-    material_cpse: dict[int, str] = {
-        m["id"]: (m.get("cpse") or "CPSE_GENERIC").strip().upper()
-        for m in store.MATERIALS
+    blockers = [_blocker(item) for item in materials]
+    material_index = {
+        item["id"]: item
+        for item in materials
     }
 
-    # Filter source materials if requested
-    filtered_sources = blocker_objects
+    cpse_by_id = {
+        item["id"]: str(
+            item.get("cpse") or "CPSE_GENERIC"
+        ).strip().upper()
+        for item in materials
+    }
+
+    source_blockers = blockers
+
     if request.source_cpse:
-        req_sc = request.source_cpse.strip().upper()
-        filtered_sources = [bo for bo in blocker_objects if material_cpse.get(bo.id) == req_sc]
+        source_cpse = request.source_cpse.upper().strip()
+        source_blockers = [
+            item
+            for item in blockers
+            if cpse_by_id.get(item.id) == source_cpse
+        ]
 
-    # --- Build inverted block index and precompute keys ---
-    block_index: dict[str, list[int]] = {}
-    material_block_keys: dict[int, set[str]] = {}
-    blocker_by_id: dict[int, MaterialForBlocking] = {}
-    target_order: dict[int, int] = {}
+    target_blockers = blockers
 
-    for idx, bo in enumerate(blocker_objects):
-        blocker_by_id[bo.id] = bo
-        target_order[bo.id] = idx
-        keys = generate_block_keys(bo)
-        material_block_keys[bo.id] = keys
-        for key in keys:
-            block_index.setdefault(key, []).append(bo.id)
+    if request.target_cpse:
+        target_cpse = request.target_cpse.upper().strip()
+        target_blockers = [
+            item
+            for item in blockers
+            if cpse_by_id.get(item.id) == target_cpse
+        ]
 
-    # --- Track already-evaluated pairs to avoid duplicates ---
-    seen_pairs: set[tuple[int, int]] = {
-        _pair_key(c["source_material_id"], c["target_material_id"])
-        for c in store.CANDIDATES
+    target_map = {
+        item.id: item
+        for item in target_blockers
     }
 
-    # Pre-partition blockers by CPSE for fast cross-CPSE target mapping
-    cpse_blockers: dict[str, dict[int, MaterialForBlocking]] = {}
-    for bo in blocker_objects:
-        c = material_cpse.get(bo.id, "CPSE_GENERIC")
-        cpse_blockers.setdefault(c, {})[bo.id] = bo
+    target_order = {
+        item.id: index
+        for index, item in enumerate(target_blockers)
+    }
 
-    target_map_by_source_cpse: dict[str, dict[int, MaterialForBlocking]] = {}
-    for s_cpse in cpse_blockers:
-        t_map: dict[int, MaterialForBlocking] = {}
-        for t_cpse, t_dict in cpse_blockers.items():
-            if t_cpse == s_cpse:
-                continue
-            if request.target_cpse and t_cpse != request.target_cpse.strip().upper():
-                continue
-            t_map.update(t_dict)
-        target_map_by_source_cpse[s_cpse] = t_map
+    block_index: dict[str, list[int]] = {}
 
-    embedding_cache = EmbeddingCache()
+    for item in target_blockers:
+        for key in generate_block_keys(item):
+            block_index.setdefault(key, []).append(item.id)
+
+    seen = {
+        _pair_key(
+            item["source_material_id"],
+            item["target_material_id"],
+        )
+        for item in store.CANDIDATES
+    }
+
+    cache = EmbeddingCache()
     new_candidates: list[dict[str, Any]] = []
-    total_pairs_evaluated = 0
+    evaluated = 0
+    vector_hits = 0
+    vector_failures = 0
 
-    for source_bo in filtered_sources:
-        source_keys = material_block_keys[source_bo.id]
-        s_cpse = material_cpse.get(source_bo.id, "CPSE_GENERIC")
-        cross_target_map = target_map_by_source_cpse.get(s_cpse)
-        if not cross_target_map:
-            continue
+    for source_blocker in source_blockers:
+        source = material_index[source_blocker.id]
 
-        raw_candidates = blocking_generate_candidates(
-            source_bo,
+        candidates = blocking_generate_candidates(
+            source_blocker,
             block_index=block_index,
-            target_map=cross_target_map,
+            target_map=target_map,
             target_order=target_order,
-            source_keys=source_keys,
+            source_keys=generate_block_keys(
+                source_blocker
+            ),
         )
 
-        # Cap cross-CPSE candidates per source material
-        raw_candidates = raw_candidates[: request.max_candidates_per_material]
+        candidates = candidates[
+            :request.max_candidates_per_material
+        ]
 
-        for target_bo in raw_candidates:
-            pk = _pair_key(source_bo.id, target_bo.id)
-            if pk in seen_pairs:
+        for target_blocker in candidates:
+            if source_blocker.id == target_blocker.id:
                 continue
-            seen_pairs.add(pk)
-            total_pairs_evaluated += 1
 
-            source_mat = material_index[source_bo.id]
-            target_mat = material_index[target_bo.id]
+            if (
+                cpse_by_id[source_blocker.id]
+                == cpse_by_id[target_blocker.id]
+            ):
+                continue
 
-            result = classify_match(source_mat, target_mat, embedding_cache=embedding_cache)
+            pair = _pair_key(
+                source_blocker.id,
+                target_blocker.id,
+            )
 
-            candidate: dict[str, Any] = {
-                "id": store.next_candidate_id(),
-                "source_material_id": source_bo.id,
-                "target_material_id": target_bo.id,
-                "source_cpse": source_mat["cpse"],
-                "target_cpse": target_mat["cpse"],
-                "source_code": source_mat["material_code"],
-                "target_code": target_mat["material_code"],
-                "source_description": source_mat["description"],
-                "target_description": target_mat["description"],
-                "scores": result["scores"],
-                "critical_checks": result["critical_checks"],
-                "engine_decision": result["decision"],
-                "review_status": "PENDING"
-                if result["decision"] in {"HIGH_CONFIDENCE", "REVIEW"}
-                else result["decision"],
-                "reviewer_id": None,
-                "reviewer_comments": None,
-                "reviewed_at": None,
-                "created_at": started_at.isoformat(),
-            }
-            new_candidates.append(candidate)
+            if pair in seen:
+                continue
 
-    # --- Additional candidates from vector search (Milvus) ---
-    # Runs AFTER the rule-based blocking above, and only ever ADDS
-    # candidates -- never removes or changes anything the rule-based loop
-    # already found. If Milvus is unavailable, this is skipped silently.
-    for source_bo in blocker_objects:
-        source_mat = material_index[source_bo.id]
+            seen.add(pair)
+            evaluated += 1
+
+            target = material_index[target_blocker.id]
+            result = classify_match(
+                source,
+                target,
+                embedding_cache=cache,
+            )
+
+            new_candidates.append(
+                _candidate(
+                    source,
+                    target,
+                    result,
+                    store.next_candidate_id(),
+                    created_at,
+                )
+            )
+
+    for source_blocker in source_blockers:
+        source = material_index[source_blocker.id]
+
         try:
             vector_ids = search_similar_materials(
-                description=source_mat.get("normalized_description", ""),
-                category=source_mat.get("category"),
-                top_k=50,
+                description=(
+                    source.get("normalized_description")
+                    or source.get("description")
+                    or ""
+                ),
+                category=source.get("category"),
+                top_k=100,
+                exclude_cpse=(
+                    cpse_by_id[source_blocker.id]
+                ),
             )
+            vector_hits += len(vector_ids)
         except Exception:
+            vector_failures += 1
             continue
 
         for target_id in vector_ids:
-            if target_id == source_bo.id or target_id not in material_index:
+            if target_id not in material_index:
                 continue
 
-            target_mat = material_index[target_id]
+            pair = _pair_key(
+                source_blocker.id,
+                target_id,
+            )
 
-            if source_mat["cpse"].upper() == target_mat["cpse"].upper():
+            if pair in seen:
                 continue
 
-            pk = _pair_key(source_bo.id, target_id)
-            if pk in seen_pairs:
-                continue
-            seen_pairs.add(pk)
-            total_pairs_evaluated += 1
+            seen.add(pair)
+            evaluated += 1
 
-            result = classify_match(source_mat, target_mat, embedding_cache=embedding_cache)
+            target = material_index[target_id]
+            result = classify_match(
+                source,
+                target,
+                embedding_cache=cache,
+            )
 
-            candidate = {
-                "id": store.next_candidate_id(),
-                "source_material_id": source_bo.id,
-                "target_material_id": target_id,
-                "source_cpse": source_mat["cpse"],
-                "target_cpse": target_mat["cpse"],
-                "source_code": source_mat["material_code"],
-                "target_code": target_mat["material_code"],
-                "source_description": source_mat["description"],
-                "target_description": target_mat["description"],
-                "scores": result["scores"],
-                "critical_checks": result["critical_checks"],
-                "engine_decision": result["decision"],
-                "review_status": "PENDING"
-                if result["decision"] in {"HIGH_CONFIDENCE", "REVIEW"}
-                else result["decision"],
-                "reviewer_id": None,
-                "reviewer_comments": None,
-                "reviewed_at": None,
-                "created_at": started_at.isoformat(),
-            }
-            new_candidates.append(candidate)
+            new_candidates.append(
+                _candidate(
+                    source,
+                    target,
+                    result,
+                    store.next_candidate_id(),
+                    created_at,
+                )
+            )
 
     store.CANDIDATES.extend(new_candidates)
 
-    finished_at = datetime.now(timezone.utc)
-    elapsed_ms = int((finished_at - started_at).total_seconds() * 1000)
+    decisions: dict[str, int] = {}
+    gates: dict[str, int] = {}
 
-    decision_counts: dict[str, int] = {}
-    for c in new_candidates:
-        d = c["engine_decision"]
-        decision_counts[d] = decision_counts.get(d, 0) + 1
+    for item in new_candidates:
+        decisions[item["ai_decision"]] = (
+            decisions.get(item["ai_decision"], 0) + 1
+        )
+        gates[item["gate_status"]] = (
+            gates.get(item["gate_status"], 0) + 1
+        )
+
+    elapsed = datetime.now(timezone.utc) - started
 
     return {
         "status": "complete",
-        "materials_processed": len(store.MATERIALS),
-        "candidate_pairs_evaluated": total_pairs_evaluated,
+        "materials_processed": len(materials),
+        "candidate_pairs_evaluated": evaluated,
         "new_candidates_stored": len(new_candidates),
         "total_candidates": len(store.CANDIDATES),
-        "decision_breakdown": decision_counts,
-        "elapsed_ms": elapsed_ms,
+        "decision_breakdown": decisions,
+        "gate_breakdown": gates,
+        "vector_search_hits": vector_hits,
+        "vector_search_failures": vector_failures,
+        "elapsed_ms": int(
+            elapsed.total_seconds() * 1000
+        ),
     }
 
 
 @router.get("/candidates")
 def list_candidates(
-    decision: str | None = Query(None, description="Filter by engine_decision: HIGH_CONFIDENCE | REVIEW | DIFFERENT"),
-    review_status: str | None = Query(None, description="Filter by review_status: PENDING | APPROVED | REJECTED"),
-    cpse: str | None = Query(None, description="Filter pairs involving this CPSE"),
-    min_score: float | None = Query(None, ge=0.0, le=1.0, description="Minimum final_score"),
+    decision: str | None = Query(None),
+    review_status: str | None = Query(None),
+    gate_status: str | None = Query(None),
+    cpse: str | None = Query(None),
+    min_score: float | None = Query(
+        None,
+        ge=0.0,
+        le=1.0,
+    ),
     skip: int = 0,
     limit: int = 50,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(
+        get_current_active_user
+    ),
 ):
-    """List all generated candidate pairs with optional filters."""
-    filtered = store.CANDIDATES
+    items = list(store.CANDIDATES)
 
     if decision:
-        filtered = [c for c in filtered if c["engine_decision"] == decision.upper()]
+        expected = decision.upper()
+        items = [
+            item for item in items
+            if item.get("ai_decision") == expected
+        ]
 
     if review_status:
-        filtered = [c for c in filtered if c["review_status"] == review_status.upper()]
+        expected = review_status.upper()
+        items = [
+            item for item in items
+            if item.get("review_status") == expected
+        ]
+
+    if gate_status:
+        expected = gate_status.upper()
+        items = [
+            item for item in items
+            if item.get("gate_status") == expected
+        ]
 
     if cpse:
-        cpse_upper = cpse.upper()
-        filtered = [
-            c for c in filtered
-            if c["source_cpse"].upper() == cpse_upper
-            or c["target_cpse"].upper() == cpse_upper
+        expected = cpse.upper()
+        items = [
+            item for item in items
+            if str(
+                item.get("source_cpse") or ""
+            ).upper() == expected
+            or str(
+                item.get("target_cpse") or ""
+            ).upper() == expected
         ]
 
     if min_score is not None:
-        filtered = [
-            c for c in filtered
-            if c["scores"].get("final_score", 0) >= min_score
+        items = [
+            item for item in items
+            if float(
+                item.get("final_score") or 0.0
+            ) >= min_score
         ]
 
-    total = len(filtered)
-    paginated = filtered[skip: skip + limit]
-
     return {
-        "total": total,
+        "total": len(items),
         "skip": skip,
         "limit": limit,
-        "candidates": paginated,
+        "candidates": items[
+            skip : skip + limit
+        ],
     }
 
 
 @router.get("/candidates/{candidate_id}")
 def get_candidate(
     candidate_id: int,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(
+        get_current_active_user
+    ),
 ):
-    """Retrieve a single candidate pair by ID."""
-    for c in store.CANDIDATES:
-        if c["id"] == candidate_id:
-            return c
-    raise HTTPException(status_code=404, detail=f"Candidate {candidate_id} not found")
+    for item in store.CANDIDATES:
+        if item["id"] == candidate_id:
+            return item
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Candidate {candidate_id} not found",
+    )
 
 
 @router.get("/stats")
-def matching_stats(current_user: User = Depends(get_current_active_user)):
-    """
-    Batch-level statistics useful for evaluation and the analytics dashboard.
-    """
-    if not store.CANDIDATES:
-        return {
-            "total_candidates": 0,
-            "message": "No candidates yet. Run POST /api/matching/run-batch first.",
-        }
+def matching_stats(
+    current_user: User = Depends(
+        get_current_active_user
+    ),
+):
+    items = list(store.CANDIDATES)
 
-    total = len(store.CANDIDATES)
-    decision_counts: dict[str, int] = {}
-    review_status_counts: dict[str, int] = {}
-    scores = []
+    decisions: dict[str, int] = {}
+    gates: dict[str, int] = {}
+    reviews: dict[str, int] = {}
+    scores: list[float] = []
 
-    for c in store.CANDIDATES:
-        d = c["engine_decision"]
-        decision_counts[d] = decision_counts.get(d, 0) + 1
-        rs = c["review_status"]
-        review_status_counts[rs] = review_status_counts.get(rs, 0) + 1
-        scores.append(c["scores"].get("final_score", 0.0))
+    for item in items:
+        decision = item.get("ai_decision")
+        gate = item.get("gate_status")
+        review = item.get("review_status")
+
+        decisions[decision] = decisions.get(decision, 0) + 1
+        gates[gate] = gates.get(gate, 0) + 1
+        reviews[review] = reviews.get(review, 0) + 1
+        scores.append(
+            float(item.get("final_score") or 0.0)
+        )
 
     scores.sort()
-    n = len(scores)
-    p50 = scores[n // 2] if n else 0.0
-    p90 = scores[int(n * 0.90)] if n else 0.0
-    p95 = scores[int(n * 0.95)] if n else 0.0
+    count = len(scores)
 
-    n_materials = len(store.MATERIALS)
-    theoretical_max = n_materials * (n_materials - 1) // 2
-    blocking_reduction = (
-        round(1.0 - total / theoretical_max, 4) if theoretical_max > 0 else None
-    )
+    def percentile(ratio: float) -> float:
+        if not scores:
+            return 0.0
+        index = min(
+            int(count * ratio),
+            count - 1,
+        )
+        return round(scores[index], 4)
 
-    reviewable = decision_counts.get("HIGH_CONFIDENCE", 0) + decision_counts.get("REVIEW", 0)
-    automation_rate = (
-        round(decision_counts.get("HIGH_CONFIDENCE", 0) / reviewable, 4)
-        if reviewable > 0
-        else None
+    high_confidence = decisions.get(
+        "HIGH_CONFIDENCE",
+        0,
     )
+    review = decisions.get("REVIEW", 0)
+    actionable = high_confidence + review
 
     return {
-        "total_candidates": total,
-        "decision_breakdown": decision_counts,
-        "review_status_breakdown": review_status_counts,
-        "automation_rate": automation_rate,
-        "blocking_reduction_ratio": blocking_reduction,
+        "total_candidates": len(items),
+        "decision_breakdown": decisions,
+        "gate_breakdown": gates,
+        "review_status_breakdown": reviews,
+        "automation_rate": (
+            round(high_confidence / actionable, 4)
+            if actionable
+            else None
+        ),
         "score_percentiles": {
-            "p50": round(p50, 4),
-            "p90": round(p90, 4),
-            "p95": round(p95, 4),
+            "p50": percentile(0.50),
+            "p90": percentile(0.90),
+            "p95": percentile(0.95),
         },
     }
 
@@ -476,22 +655,28 @@ def matching_stats(current_user: User = Depends(get_current_active_user)):
 @router.post("/cnmc/candidates")
 def find_cnmc_proposals(
     request: CnmcMatchRequest,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(
+        get_current_active_user
+    ),
 ):
-    """Find and rank plausible existing CNMC candidate proposals for a material."""
-    prepared = _prepare_material(request.material)
+    material = _prepare_material(request.material)
+
     proposals = find_cnmc_candidates_for_material(
-        prepared,
+        material,
         max_candidates=request.max_candidates,
         min_score=request.min_score,
     )
-    margin_info = compute_cnmc_candidate_margin(proposals)
+
+    margin = compute_cnmc_candidate_margin(proposals)
+
     return {
-        "material": prepared,
+        "material": material,
         "total_candidates": len(proposals),
-        "best_score": margin_info["best_score"],
-        "second_best_score": margin_info["second_best_score"],
-        "score_margin": margin_info["score_margin"],
+        "best_score": margin["best_score"],
+        "second_best_score": margin[
+            "second_best_score"
+        ],
+        "score_margin": margin["score_margin"],
         "candidates": proposals,
     }
 
@@ -499,24 +684,32 @@ def find_cnmc_proposals(
 @router.post("/cnmc/run-batch")
 def run_cnmc_batch_matching(
     request: CnmcBatchRunRequest,
-    current_user: User = Depends(require_permission("run_matching")),
+    current_user: User = Depends(
+        require_permission("run_matching")
+    ),
 ):
-    """Run existing-CNMC matching across all ingested materials against established CNMCs."""
     if not store.MATERIALS:
-        raise HTTPException(status_code=400, detail="No materials ingested.")
+        raise HTTPException(
+            status_code=400,
+            detail="No materials ingested.",
+        )
+
     if not store.CNMC_REGISTRY:
         return {
             "status": "no_existing_cnmc",
             "materials_evaluated": len(store.MATERIALS),
             "proposals_generated": 0,
-            "message": "No existing CNMCs in registry.",
             "proposals": [],
         }
-    res = match_new_materials_against_cnmcs(
+
+    return match_new_materials_against_cnmcs(
         list(store.MATERIALS),
-        max_candidates_per_material=request.max_candidates_per_material,
+        max_candidates_per_material=(
+            request.max_candidates_per_material
+        ),
         min_score=request.min_score,
-        create_review_candidates=request.create_review_candidates,
+        create_review_candidates=(
+            request.create_review_candidates
+        ),
         current_user=current_user,
     )
-    return res

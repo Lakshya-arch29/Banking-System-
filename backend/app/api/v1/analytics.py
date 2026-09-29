@@ -1,129 +1,231 @@
-"""
-Analytics route.
-
-GET /api/analytics/overview    — dashboard-level KPIs
-GET /api/analytics/by-cpse     — material and match counts per CPSE
-GET /api/analytics/categories  — category distribution
-GET /api/analytics/scores      — score histogram buckets
-"""
-
 from fastapi import APIRouter, Depends
 
 from app import store
 from app.core.security import get_current_active_user
 from app.models.user import User
 
-router = APIRouter(prefix="/analytics", tags=["Analytics"])
+
+router = APIRouter(
+    prefix="/analytics",
+    tags=["Analytics"],
+)
+
+
+def _materials():
+    return list(store.MATERIALS)
+
+
+def _candidates():
+    return list(store.CANDIDATES)
 
 
 @router.get("/overview")
-def analytics_overview(current_user: User = Depends(get_current_active_user)):
-    """High-level KPIs for the dashboard header cards."""
-    total_materials = len(store.MATERIALS)
-    total_candidates = len(store.CANDIDATES)
+def analytics_overview(
+    current_user: User = Depends(get_current_active_user),
+):
+    materials = _materials()
+    candidates = _candidates()
 
     high_confidence = sum(
-        1 for c in store.CANDIDATES if c["engine_decision"] == "HIGH_CONFIDENCE"
+        c.get("ai_decision") == "HIGH_CONFIDENCE"
+        for c in candidates
     )
-    review_pending = sum(
-        1 for c in store.CANDIDATES
-        if c["engine_decision"] == "REVIEW" and c["review_status"] == "PENDING"
+
+    review_recommendations = sum(
+        c.get("ai_decision") == "REVIEW"
+        for c in candidates
     )
+
+    pending = sum(
+        c.get("review_status") == "PENDING"
+        and c.get("ai_decision") in {
+            "HIGH_CONFIDENCE",
+            "REVIEW",
+        }
+        for c in candidates
+    )
+
     approved = sum(
-        1 for c in store.CANDIDATES if c["review_status"] == "APPROVED"
+        c.get("review_status") == "APPROVED"
+        for c in candidates
     )
+
     rejected = sum(
-        1 for c in store.CANDIDATES if c["review_status"] == "REJECTED"
+        c.get("review_status") == "REJECTED"
+        for c in candidates
     )
 
-    # Automation rate: pairs resolved without human (HC) / all actionable pairs
-    actionable = high_confidence + sum(
-        1 for c in store.CANDIDATES if c["engine_decision"] == "REVIEW"
+    gate_pass = sum(
+        c.get("gate_status") == "PASS"
+        for c in candidates
     )
-    automation_rate = round(high_confidence / actionable, 4) if actionable else None
 
-    cpse_count = len({m["cpse"] for m in store.MATERIALS})
+    gate_unknown = sum(
+        c.get("gate_status") == "UNKNOWN"
+        for c in candidates
+    )
+
+    gate_conflict = sum(
+        c.get("gate_status") == "CONFLICT"
+        for c in candidates
+    )
+
+    actionable = (
+        high_confidence + review_recommendations
+    )
+
+    automation_rate = (
+        round(high_confidence / actionable, 4)
+        if actionable
+        else None
+    )
+
+    cpse_count = len(
+        {
+            str(m.get("cpse") or "CPSE_GENERIC")
+            for m in materials
+        }
+    )
 
     return {
-        "total_materials": total_materials,
+        "total_materials": len(materials),
         "cpse_count": cpse_count,
-        "total_candidate_pairs": total_candidates,
+        "total_candidate_pairs": len(candidates),
         "high_confidence": high_confidence,
-        "review_pending": review_pending,
+        "review_recommendations": review_recommendations,
+        "review_pending": pending,
         "approved": approved,
         "rejected": rejected,
         "automation_rate": automation_rate,
+        "gate_breakdown": {
+            "pass": gate_pass,
+            "unknown": gate_unknown,
+            "conflict": gate_conflict,
+        },
     }
 
 
 @router.get("/by-cpse")
-def analytics_by_cpse(current_user: User = Depends(get_current_active_user)):
-    """Per-CPSE breakdown: material count and involvement in candidate pairs."""
-    cpse_materials: dict[str, int] = {}
-    for m in store.MATERIALS:
-        cpse_materials[m["cpse"]] = cpse_materials.get(m["cpse"], 0) + 1
+def analytics_by_cpse(
+    current_user: User = Depends(get_current_active_user),
+):
+    material_counts: dict[str, int] = {}
+    candidate_counts: dict[str, int] = {}
 
-    cpse_candidates: dict[str, int] = {}
-    for c in store.CANDIDATES:
-        for cpse in (c["source_cpse"], c["target_cpse"]):
-            cpse_candidates[cpse] = cpse_candidates.get(cpse, 0) + 1
+    for material in _materials():
+        cpse = material.get("cpse") or "CPSE_GENERIC"
+        material_counts[cpse] = (
+            material_counts.get(cpse, 0) + 1
+        )
+
+    for candidate in _candidates():
+        source_cpse = (
+            candidate.get("source_cpse")
+            or "CPSE_GENERIC"
+        )
+        target_cpse = (
+            candidate.get("target_cpse")
+            or "CPSE_GENERIC"
+        )
+
+        candidate_counts[source_cpse] = (
+            candidate_counts.get(source_cpse, 0) + 1
+        )
+
+        candidate_counts[target_cpse] = (
+            candidate_counts.get(target_cpse, 0) + 1
+        )
 
     rows = []
-    for cpse, mat_count in sorted(cpse_materials.items()):
-        rows.append({
-            "cpse": cpse,
-            "material_count": mat_count,
-            "candidate_pair_involvements": cpse_candidates.get(cpse, 0),
-        })
+
+    for cpse in sorted(material_counts):
+        rows.append(
+            {
+                "cpse": cpse,
+                "material_count": material_counts[cpse],
+                "candidate_pair_involvements": (
+                    candidate_counts.get(cpse, 0)
+                ),
+            }
+        )
 
     return {"cpse_breakdown": rows}
 
 
 @router.get("/categories")
-def analytics_categories(current_user: User = Depends(get_current_active_user)):
-    """Category distribution of ingested materials."""
+def analytics_categories(
+    current_user: User = Depends(get_current_active_user),
+):
     counts: dict[str, int] = {}
-    for m in store.MATERIALS:
-        cat = m.get("category") or "Uncategorised"
-        counts[cat] = counts.get(cat, 0) + 1
 
-    rows = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    for material in _materials():
+        category = (
+            material.get("category")
+            or "Uncategorised"
+        )
+
+        counts[category] = (
+            counts.get(category, 0) + 1
+        )
+
+    rows = sorted(
+        counts.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
     return {
         "category_distribution": [
-            {"category": cat, "count": cnt} for cat, cnt in rows
+            {
+                "category": category,
+                "count": count,
+            }
+            for category, count in rows
         ]
     }
 
 
 @router.get("/scores")
-def analytics_score_distribution(current_user: User = Depends(get_current_active_user)):
-    """
-    Final-score histogram in 0.1-wide buckets.
-    Useful for tuning thresholds and spotting score distribution shape.
-    """
-    buckets = {f"{i/10:.1f}-{(i+1)/10:.1f}": 0 for i in range(10)}
+def analytics_scores(
+    current_user: User = Depends(get_current_active_user),
+):
+    buckets = {
+        f"{i / 10:.1f}-{(i + 1) / 10:.1f}": 0
+        for i in range(10)
+    }
 
-    for c in store.CANDIDATES:
-        score = c["scores"].get("final_score", 0.0)
-        bucket_idx = min(int(score * 10), 9)
-        key = f"{bucket_idx/10:.1f}-{(bucket_idx + 1)/10:.1f}"
-        buckets[key] = buckets.get(key, 0) + 1
+    for candidate in _candidates():
+        try:
+            score = float(
+                candidate.get("final_score") or 0.0
+            )
+        except (TypeError, ValueError):
+            score = 0.0
+
+        score = max(0.0, min(1.0, score))
+        index = min(int(score * 10), 9)
+        key = f"{index / 10:.1f}-{(index + 1) / 10:.1f}"
+        buckets[key] += 1
 
     return {
-        "total_candidates": len(store.CANDIDATES),
+        "total_candidates": len(_candidates()),
         "score_histogram": [
-            {"bucket": k, "count": v} for k, v in buckets.items()
+            {
+                "bucket": bucket,
+                "count": count,
+            }
+            for bucket, count in buckets.items()
         ],
     }
 
 
 @router.get("/data-quality")
-def analytics_data_quality(current_user: User = Depends(get_current_active_user)):
-    """
-    Data-quality breakdown computed directly from ingested materials in the master store.
-    Measures field completeness, specification parsing yield, and CPSE data health.
-    """
-    total = len(store.MATERIALS)
+def analytics_data_quality(
+    current_user: User = Depends(get_current_active_user),
+):
+    materials = _materials()
+    total = len(materials)
+
     if total == 0:
         return {
             "total_materials": 0,
@@ -139,89 +241,149 @@ def analytics_data_quality(current_user: User = Depends(get_current_active_user)
             "by_cpse_quality": [],
         }
 
-    with_parsed_specs = 0
-    missing_desc = 0
-    missing_cat = 0
+    missing_description = 0
+    missing_category = 0
     missing_grade = 0
-    missing_dim = 0
+    missing_dimensions = 0
     missing_pressure = 0
-    parsing_failures = 0
+    parsed_count = 0
 
     cpse_stats: dict[str, dict[str, int]] = {}
 
-    for m in store.MATERIALS:
-        cpse = m.get("cpse") or "CPSE_GENERIC"
-        if cpse not in cpse_stats:
-            cpse_stats[cpse] = {
+    for material in materials:
+        cpse = material.get("cpse") or "CPSE_GENERIC"
+
+        stats = cpse_stats.setdefault(
+            cpse,
+            {
                 "total": 0,
                 "with_parsed_specs": 0,
                 "missing_grade": 0,
                 "missing_dimensions": 0,
                 "missing_pressure": 0,
-            }
-        cpse_stats[cpse]["total"] += 1
+            },
+        )
 
-        desc = (m.get("description") or "").strip()
-        if not desc:
-            missing_desc += 1
+        stats["total"] += 1
 
-        cat = (m.get("category") or "").strip()
-        if not cat or cat.upper() in ("GENERAL", "UNCATEGORISED", "UNKNOWN"):
-            missing_cat += 1
+        if not str(
+            material.get("description") or ""
+        ).strip():
+            missing_description += 1
 
-        parsed = m.get("parsed_specifications") or {}
-        if parsed and any(v is not None for v in parsed.values()):
-            with_parsed_specs += 1
-            cpse_stats[cpse]["with_parsed_specs"] += 1
-        else:
-            parsing_failures += 1
+        category = str(
+            material.get("category") or ""
+        ).strip().upper()
 
-        grade = m.get("material_grade") or parsed.get("material_grade")
+        if category in {
+            "",
+            "GENERAL",
+            "UNKNOWN",
+            "UNCATEGORISED",
+        }:
+            missing_category += 1
+
+        parsed = (
+            material.get("parsed_specifications")
+            or {}
+        )
+
+        has_parsed = bool(parsed) and any(
+            value is not None
+            for value in parsed.values()
+        )
+
+        if has_parsed:
+            parsed_count += 1
+            stats["with_parsed_specs"] += 1
+
+        grade = (
+            material.get("material_grade")
+            or parsed.get("material_grade")
+        )
+
         if not grade:
             missing_grade += 1
-            cpse_stats[cpse]["missing_grade"] += 1
+            stats["missing_grade"] += 1
 
-        dim = m.get("dimensions") or parsed.get("dimensions") or parsed.get("nominal_bore") or parsed.get("dimension_tokens")
-        if not dim:
-            missing_dim += 1
-            cpse_stats[cpse]["missing_dimensions"] += 1
+        dimensions = (
+            material.get("dimensions")
+            or parsed.get("dimensions")
+            or parsed.get("nominal_bore")
+            or parsed.get("dimension_tokens")
+        )
 
-        pressure = parsed.get("pressure_rating")
-        if not pressure:
+        if not dimensions:
+            missing_dimensions += 1
+            stats["missing_dimensions"] += 1
+
+        if not parsed.get("pressure_rating"):
             missing_pressure += 1
-            cpse_stats[cpse]["missing_pressure"] += 1
+            stats["missing_pressure"] += 1
 
-    desc_rate = (total - missing_desc) / total
-    cat_rate = (total - missing_cat) / total
-    parsed_rate = with_parsed_specs / total
-    grade_rate = (total - missing_grade) / total
+    description_rate = (
+        total - missing_description
+    ) / total
+
+    category_rate = (
+        total - missing_category
+    ) / total
+
+    parsed_rate = parsed_count / total
+
+    grade_rate = (
+        total - missing_grade
+    ) / total
+
     completeness_score = round(
-        (desc_rate * 0.3 + cat_rate * 0.2 + parsed_rate * 0.3 + grade_rate * 0.2), 4
+        description_rate * 0.30
+        + category_rate * 0.20
+        + parsed_rate * 0.30
+        + grade_rate * 0.20,
+        4,
     )
 
-    by_cpse_quality = [
-        {
-            "cpse": c,
-            "total_materials": s["total"],
-            "with_parsed_specs": s["with_parsed_specs"],
-            "parsed_specs_rate": round(s["with_parsed_specs"] / s["total"], 4) if s["total"] else 0.0,
-            "missing_grade": s["missing_grade"],
-            "missing_dimensions": s["missing_dimensions"],
-            "missing_pressure": s["missing_pressure"],
-        }
-        for c, s in sorted(cpse_stats.items())
-    ]
+    by_cpse_quality = []
+
+    for cpse in sorted(cpse_stats):
+        stats = cpse_stats[cpse]
+        cpse_total = stats["total"]
+
+        by_cpse_quality.append(
+            {
+                "cpse": cpse,
+                "total_materials": cpse_total,
+                "with_parsed_specs": (
+                    stats["with_parsed_specs"]
+                ),
+                "parsed_specs_rate": round(
+                    stats["with_parsed_specs"]
+                    / cpse_total,
+                    4,
+                ),
+                "missing_grade": stats["missing_grade"],
+                "missing_dimensions": (
+                    stats["missing_dimensions"]
+                ),
+                "missing_pressure": (
+                    stats["missing_pressure"]
+                ),
+            }
+        )
 
     return {
         "total_materials": total,
-        "with_parsed_specs": with_parsed_specs,
-        "parsed_specs_rate": round(with_parsed_specs / total, 4),
-        "missing_description": missing_desc,
-        "missing_category": missing_cat,
+        "with_parsed_specs": parsed_count,
+        "parsed_specs_rate": round(
+            parsed_rate,
+            4,
+        ),
+        "missing_description": missing_description,
+        "missing_category": missing_category,
         "missing_material_grade": missing_grade,
-        "missing_dimensions": missing_dim,
+        "missing_dimensions": missing_dimensions,
         "missing_pressure_rating": missing_pressure,
-        "parsing_failures": parsing_failures,
+        "parsing_failures": total - parsed_count,
         "completeness_score": completeness_score,
         "by_cpse_quality": by_cpse_quality,
     }
