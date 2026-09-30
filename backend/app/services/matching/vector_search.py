@@ -39,6 +39,7 @@ def search_similar_materials(
     category: str | None = None,
     top_k: int | None = None,
     exclude_cpse: str | None = None,
+    embedding_cache: Any = None,
 ) -> list[int]:
     """
     Returns material ids ordered most-similar-first, or [] if unavailable.
@@ -61,7 +62,13 @@ def search_similar_materials(
     if not description:
         return []
 
-    query_embedding = generate_embedding(description)
+    if embedding_cache is not None:
+        emb = embedding_cache.get_or_encode(description)
+        if emb is None:
+            return []
+        query_embedding = emb.tolist() if hasattr(emb, "tolist") else emb
+    else:
+        query_embedding = generate_embedding(description)
     if not query_embedding:
         return []
 

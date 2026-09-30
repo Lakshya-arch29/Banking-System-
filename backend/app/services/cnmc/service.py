@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
@@ -54,9 +54,7 @@ def generate_or_get_cnmc(
         return {
             "id": existing_row["id"],
             "cnmc_code": existing_row["cnmc_code"],
-            "global_id": existing_row["global_id"],
             "identity_hash": existing_row["identity_hash"],
-            "material_type": existing_row["material_type"],
             "category": existing_row["category"],
             "canonical_material_record": existing_row["canonical_material_record"],
             "status": existing_row["status"],
@@ -78,8 +76,6 @@ def generate_or_get_cnmc(
     new_record = {
         "cnmc_code": cnmc_code,
         "identity_hash": identity_hash,
-        "global_id": global_id,
-        "material_type": type_code,
         "standardized_description": standardized_description,
         "category": category if category and category != "UNKNOWN" else "General",
         "unspsc_code": None,
@@ -101,9 +97,7 @@ def generate_or_get_cnmc(
             return {
                 "id": existing_row["id"],
                 "cnmc_code": existing_row["cnmc_code"],
-                "global_id": existing_row["global_id"],
                 "identity_hash": existing_row["identity_hash"],
-                "material_type": existing_row["material_type"],
                 "category": existing_row["category"],
                 "canonical_material_record": existing_row["canonical_material_record"],
                 "status": existing_row["status"],
@@ -119,12 +113,12 @@ def generate_or_get_cnmc(
     return {
         "id": inserted_row["id"] if inserted_row else global_id,
         "cnmc_code": cnmc_code,
-        "global_id": global_id,
         "identity_hash": identity_hash,
-        "material_type": type_code,
         "category": new_record["category"],
         "canonical_material_record": cmr,
         "status": "ACTIVE",
         "is_new": True,
     }
+
+
 

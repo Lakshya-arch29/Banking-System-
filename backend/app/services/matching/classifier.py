@@ -9,13 +9,18 @@ from app.services.matching.scoring import calculate_match_score
 
 
 # Conservative starting points.
-# Final threshold must be selected using DEV evaluation.
 HIGH_CONFIDENCE_SCORE = float(
-    os.getenv("MIRA_HIGH_CONFIDENCE_SCORE", "0.85")
+    os.getenv(
+        "MIRA_HIGH_CONFIDENCE_SCORE",
+        "0.85",
+    )
 )
 
 DIFFERENT_SCORE = float(
-    os.getenv("MIRA_DIFFERENT_SCORE", "0.45")
+    os.getenv(
+        "MIRA_DIFFERENT_SCORE",
+        "0.45",
+    )
 )
 
 
@@ -25,12 +30,11 @@ def classify_match(
     embedding_cache: Any = None,
 ) -> dict[str, Any]:
     """
-    Score and classify a candidate material pair.
+    Score and classify one material pair.
 
-    Critical gates can prevent HIGH_CONFIDENCE even when
-    the numerical similarity score is high.
+    The shared embedding cache ensures that each unique description
+    is encoded by MIRA.ai only once during a matching run.
     """
-
     scores = calculate_match_score(
         source,
         target,
@@ -58,16 +62,19 @@ def classify_match(
         critical_checks
     )
 
-    if (
+    if has_conflict:
+        decision = "DIFFERENT"
+
+    elif (
         final_score >= HIGH_CONFIDENCE_SCORE
         and gates_pass
     ):
         decision = "HIGH_CONFIDENCE"
 
-    elif has_unknown or has_conflict:
-        decision = "REVIEW"
-
-    elif final_score > DIFFERENT_SCORE:
+    elif (
+        has_unknown
+        or final_score > DIFFERENT_SCORE
+    ):
         decision = "REVIEW"
 
     else:
