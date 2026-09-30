@@ -7,306 +7,169 @@ from typing import Any
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-
-# ============================================================================
-# MODEL CONFIGURATION
-# ============================================================================
-
-# This is the trained MIRA model available in the user's Hugging Face cache.
-# The cache contains:
-#   AshIndian/Mira.ai
-#   Qwen/Qwen3-Embedding-0.6B
-#   sentence-transformers/all-MiniLM-L6-v2
-#
-# MIRA.ai is now the production default.
-DEFAULT_MODEL_NAME = "AshIndian/Mira.ai"
-
-# The expected dimension for the MIRA/Qwen embedding architecture.
-EMBEDDING_DIM = 1024
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-
-PROJECT_MODEL_PATHS = [
-    PROJECT_ROOT / "models" / "Mira.ai",
-    PROJECT_ROOT / "models" / "trained" / "Mira.ai",
-    PROJECT_ROOT / "models" / "qwen_quantized",
-    PROJECT_ROOT / "models" / "trained" / "minilm_cpse_v1",
-]
-
-HF_CACHE_ROOT = (
-    Path.home()
-    / ".cache"
-    / "huggingface"
-    / "hub"
-)
+DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
 
 
-# ============================================================================
-# MODEL PATH DISCOVERY
-# ============================================================================
+def _get_project_root() -> Path:
+    """Find the MIRA workspace root portably across operating systems."""
+    cur = Path(__file__).resolve().parent
+    for parent in [cur] + list(cur.parents):
+        if (parent / "backend").exists() and (parent / "models").exists():
+            return parent
+        if (parent / ".git").exists():
+            return parent
+    return Path(__file__).resolve().parents[3]
 
 
-def _find_huggingface_snapshot(
-    repository_folder_name: str,
-) -> Path | None:
-    """
-    Find the latest local Hugging Face snapshot for a cached model.
+PROJECT_ROOT = _get_project_root()
+TRAINED_MODEL_PATH = PROJECT_ROOT / "models" / "trained" / "minilm_cpse_v1"
 
-    Example:
-        models--AshIndian--Mira.ai
-        models--Qwen--Qwen3-Embedding-0.6B
-    """
-    model_root = (
-        HF_CACHE_ROOT
-        / repository_folder_name
-        / "snapshots"
-    )
 
-    if not model_root.exists():
-        return None
+def get_qwen_candidate_paths() -> list[Path]:
+    """Return prioritized candidate search paths for the local Qwen model across OSes."""
+    env_paths = [
+        Path(os.getenv("MIRA_QWEN_MODEL_PATH", "").strip()),
+        Path(os.getenv("MIRA_MODEL_PATH", "").strip()),
+    ]
+    models_dir = os.getenv("MIRA_MODELS_DIR", "").strip()
+    if models_dir:
+        env_paths.append(Path(models_dir) / "Mira.ai")
 
-    snapshots = [
-        path
-        for path in model_root.iterdir()
-        if path.is_dir()
+    home = Path.home()
+    standard_paths = [
+        home / "mira-model-test" / "Mira.ai",
+        home / "Desktop" / "mira-model-test" / "Mira.ai",
+        home / ".mira" / "models" / "Mira.ai",
+        home / "models" / "Mira.ai",
+        PROJECT_ROOT / "models" / "Mira.ai",
+        PROJECT_ROOT / "models" / "trained" / "Mira.ai",
+        PROJECT_ROOT / "models" / "trained" / "qwen",
+        PROJECT_ROOT / "models" / "qwen",
     ]
 
-    if not snapshots:
-        return None
-
-    # The latest modified snapshot is the safest choice when more than
-    # one cached revision exists.
-    return max(
-        snapshots,
-        key=lambda path: path.stat().st_mtime,
-    )
+    candidates: list[Path] = []
+    for p in env_paths + standard_paths:
+        if p and str(p) != "." and p not in candidates:
+            candidates.append(p)
+    return candidates
 
 
-def _mira_model_target() -> str:
+def find_qwen_model_path() -> Path | None:
+    """Locate the Qwen embedding directory on the current filesystem."""
+    for p in get_qwen_candidate_paths():
+        try:
+            if p.exists() and (p / "config.json").exists():
+                return p
+        except (OSError, PermissionError):
+            continue
+    return None
+
+
+def get_embedding_dimension(model_name: str | None = None) -> int:
+    """Derive embedding dimension dynamically from the active or specified model."""
+    model = get_embedding_model(model_name)
+    if hasattr(model, "get_embedding_dimension"):
+        try:
+            dim = model.get_embedding_dimension()
+            if dim is not None:
+                return int(dim)
+        except Exception:
+            pass
+    if hasattr(model, "get_sentence_embedding_dimension"):
+        try:
+            dim = model.get_sentence_embedding_dimension()
+            if dim is not None:
+                return int(dim)
+        except Exception:
+            pass
+    return 1024
+
+
+def resolve_model_name(name_or_alias: str | None = None) -> str:
     """
-    Resolve the trained MIRA model.
+    Resolve model alias or environment variable into a valid model path or identifier.
 
-    Priority:
-    1. A project-local model directory.
-    2. A cached Hugging Face AshIndian/Mira.ai snapshot.
-    3. The Hugging Face model ID, allowing a normal cached/downloaded load.
+    Resolution hierarchy:
+      1. Explicit or env-specified alias:
+         - 'qwen' / 'production' / 'default': local Qwen INT8 model if present, else fallback
+         - 'minilm': fine-tuned MiniLM checkpoint if available, else all-MiniLM-L6-v2
+         - 'base-minilm' / 'base_minilm': all-MiniLM-L6-v2
+      2. If unset:
+         - Priority 1: local Qwen INT8 model (~/Desktop/mira-model-test/Mira.ai or ~/mira-model-test/Mira.ai)
+         - Priority 2: local fine-tuned MiniLM checkpoint
+         - Priority 3: base all-MiniLM-L6-v2
     """
-    for path in PROJECT_MODEL_PATHS:
-        if (
-            path.exists()
-            and (
-                (path / "config.json").exists()
-                or (path / "modules.json").exists()
-            )
-        ):
-            return str(path)
-
-    cached_snapshot = _find_huggingface_snapshot(
-        "models--AshIndian--Mira.ai"
-    )
-
-    if cached_snapshot is not None:
-        return str(cached_snapshot)
-
-    return DEFAULT_MODEL_NAME
-
-
-def _qwen_model_target() -> str:
-    """
-    Resolve the base Qwen model.
-
-    Priority:
-    1. A cached Qwen snapshot.
-    2. The Hugging Face model ID.
-    """
-    cached_snapshot = _find_huggingface_snapshot(
-        "models--Qwen--Qwen3-Embedding-0.6B"
-    )
-
-    if cached_snapshot is not None:
-        return str(cached_snapshot)
-
-    return "Qwen/Qwen3-Embedding-0.6B"
-
-
-def _minilm_model_target() -> str:
-    """
-    Resolve the optional trained MiniLM model, falling back to the
-    standard MiniLM model if the trained checkpoint is unavailable.
-    """
-    trained_minilm = (
-        PROJECT_ROOT
-        / "models"
-        / "trained"
-        / "minilm_cpse_v1"
-    )
-
-    if (
-        trained_minilm.exists()
-        and (trained_minilm / "config.json").exists()
-    ):
-        return str(trained_minilm)
-
-    cached_snapshot = _find_huggingface_snapshot(
-        "models--sentence-transformers--all-MiniLM-L6-v2"
-    )
-
-    if cached_snapshot is not None:
-        return str(cached_snapshot)
-
-    return "all-MiniLM-L6-v2"
-
-
-def resolve_model_name(
-    name_or_alias: str | None = None,
-) -> str:
-    """
-    Resolve the active embedding model.
-
-    Supported aliases:
-
-        mira
-        mira.ai
-        qwen
-        minilm
-        base-minilm
-        base_minilm
-
-    An explicit path or Hugging Face model ID is also accepted.
-
-    Environment variable:
-
-        MIRA_EMBEDDING_MODEL
-
-    Examples:
-
-        MIRA_EMBEDDING_MODEL=mira
-        MIRA_EMBEDDING_MODEL=qwen
-        MIRA_EMBEDDING_MODEL=C:\\models\\Mira.ai
-    """
-    target = (
-        name_or_alias
-        if name_or_alias is not None
-        else os.getenv("MIRA_EMBEDDING_MODEL", "")
-    )
-
+    target = name_or_alias if name_or_alias is not None else os.getenv("MIRA_EMBEDDING_MODEL", "")
     target = target.strip()
 
-    # No override means use the trained MIRA model.
-    if not target:
-        return _mira_model_target()
+    qwen_path = find_qwen_model_path()
+
+    if not target or target.lower() in ("default", "production"):
+        if qwen_path is not None:
+            return str(qwen_path)
+        if TRAINED_MODEL_PATH.exists() and (TRAINED_MODEL_PATH / "model.safetensors").exists():
+            return str(TRAINED_MODEL_PATH)
+        return DEFAULT_MODEL_NAME
 
     target_lower = target.lower()
-
-    if target_lower in {
-        "mira",
-        "mira.ai",
-        "ashindian/mira.ai",
-    }:
-        return _mira_model_target()
-
     if target_lower == "qwen":
-        return _qwen_model_target()
+        if qwen_path is not None:
+            return str(qwen_path)
+        return "qwen"
+    elif target_lower == "minilm":
+        if TRAINED_MODEL_PATH.exists() and (TRAINED_MODEL_PATH / "model.safetensors").exists():
+            return str(TRAINED_MODEL_PATH)
+        return DEFAULT_MODEL_NAME
+    elif target_lower in ("base-minilm", "base_minilm"):
+        return DEFAULT_MODEL_NAME
 
-    if target_lower == "minilm":
-        return _minilm_model_target()
-
-    if target_lower in {
-        "base-minilm",
-        "base_minilm",
-    }:
-        return "all-MiniLM-L6-v2"
-
-    # An explicit local path or Hugging Face model ID.
     return target
 
 
 def get_embedding_model_name() -> str:
-    """Return the resolved model target used by the application."""
     return resolve_model_name()
 
 
 @lru_cache(maxsize=4)
 def _load_model(target: str) -> SentenceTransformer:
-    """
-    Load and cache one SentenceTransformer instance per model target.
-    """
-    return SentenceTransformer(
-        target,
-        device="cpu",
-    )
+    return SentenceTransformer(target, device="cpu")
 
 
-def get_embedding_model(
-    model_name: str | None = None,
-) -> SentenceTransformer:
-    """Return the active embedding model."""
+def get_embedding_model(model_name: str | None = None) -> SentenceTransformer:
     resolved = resolve_model_name(model_name)
     return _load_model(resolved)
 
 
-# ============================================================================
-# BATCH EMBEDDING CACHE
-# ============================================================================
-
-
 class EmbeddingCache:
     """
-    Scoped in-memory embedding cache for one matching batch.
+    Scoped in-memory embedding cache for a matching batch or request.
 
-    Each cache key includes the resolved model target so embeddings from
-    different models can never be mixed accidentally.
+    Precomputes or lazily caches normalized embeddings for unique texts
+    so that repeated material descriptions are encoded at most once.
+    Distinguishes models in the cache key to prevent cross-model cache contamination.
     """
 
     def __init__(
         self,
-        initial_embeddings: (
-            dict[str, np.ndarray] | None
-        ) = None,
+        initial_embeddings: dict[str, np.ndarray] | None = None,
         model_name: str | None = None,
     ):
         self.model_name = resolve_model_name(model_name)
-        self._cache: dict[
-            tuple[str, str],
-            np.ndarray,
-        ] = {}
-
+        self._cache: dict[tuple[str, str], np.ndarray] = {}
         if initial_embeddings:
-            for text, embedding in initial_embeddings.items():
-                self._cache[
-                    (self.model_name, text)
-                ] = embedding
+            for text, emb in initial_embeddings.items():
+                self._cache[(self.model_name, text)] = emb
 
-    def _resolve_model(
-        self,
-        model_name: str | None = None,
-    ) -> str:
-        return (
-            resolve_model_name(model_name)
-            if model_name is not None
-            else self.model_name
-        )
+    def _resolve_model(self, model_name: str | None = None) -> str:
+        return resolve_model_name(model_name) if model_name is not None else self.model_name
 
-    def get(
-        self,
-        text: str,
-        model_name: str | None = None,
-    ) -> np.ndarray | None:
-        resolved = self._resolve_model(model_name)
-        return self._cache.get(
-            (resolved, text)
-        )
+    def get(self, text: str, model_name: str | None = None) -> np.ndarray | None:
+        m = self._resolve_model(model_name)
+        return self._cache.get((m, text))
 
-    def set(
-        self,
-        text: str,
-        embedding: np.ndarray,
-        model_name: str | None = None,
-    ) -> None:
-        resolved = self._resolve_model(model_name)
-        self._cache[
-            (resolved, text)
-        ] = embedding
+    def set(self, text: str, embedding: np.ndarray, model_name: str | None = None) -> None:
+        m = self._resolve_model(model_name)
+        self._cache[(m, text)] = embedding
 
     def precompute(
         self,
@@ -314,96 +177,44 @@ class EmbeddingCache:
         batch_size: int = 64,
         model_name: str | None = None,
     ) -> None:
-        resolved = self._resolve_model(model_name)
+        m = self._resolve_model(model_name)
+        missing = [t for t in set(texts) if t and (m, t) not in self._cache]
+        if missing:
+            model = get_embedding_model(m)
+            embeddings = model.encode(
+                missing,
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            for text, emb in zip(missing, embeddings):
+                self._cache[(m, text)] = emb
 
-        unique_texts = {
-            text
-            for text in texts
-            if text
-        }
-
-        missing = [
-            text
-            for text in unique_texts
-            if (
-                resolved,
-                text,
-            ) not in self._cache
-        ]
-
-        if not missing:
-            return
-
-        model = get_embedding_model(resolved)
-
-        embeddings = model.encode(
-            missing,
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-
-        for text, embedding in zip(
-            missing,
-            embeddings,
-        ):
-            self._cache[
-                (resolved, text)
-            ] = embedding
-
-    def get_or_encode(
-        self,
-        text: str,
-        model_name: str | None = None,
-    ) -> np.ndarray | None:
+    def get_or_encode(self, text: str, model_name: str | None = None) -> np.ndarray | None:
         if not text:
             return None
-
-        resolved = self._resolve_model(model_name)
-        key = (resolved, text)
-
+        m = self._resolve_model(model_name)
+        key = (m, text)
         if key not in self._cache:
-            model = get_embedding_model(resolved)
-
+            model = get_embedding_model(m)
             self._cache[key] = model.encode(
                 text,
                 normalize_embeddings=True,
             )
-
         return self._cache[key]
 
-    def similarity(
-        self,
-        left: str,
-        right: str,
-        model_name: str | None = None,
-    ) -> float:
+    def similarity(self, left: str, right: str, model_name: str | None = None) -> float:
         if not left or not right:
             return 0.0
 
-        left_vector = self.get_or_encode(
-            left,
-            model_name=model_name,
-        )
-        right_vector = self.get_or_encode(
-            right,
-            model_name=model_name,
-        )
+        vec_a = self.get_or_encode(left, model_name=model_name)
+        vec_b = self.get_or_encode(right, model_name=model_name)
 
-        if (
-            left_vector is None
-            or right_vector is None
-        ):
+        if vec_a is None or vec_b is None:
             return 0.0
 
-        similarity = float(
-            left_vector @ right_vector
-        )
-
-        return max(
-            0.0,
-            min(1.0, similarity),
-        )
+        sim = float(vec_a @ vec_b)
+        return max(0.0, min(1.0, sim))
 
     def clear(self) -> None:
         self._cache.clear()
@@ -412,10 +223,7 @@ class EmbeddingCache:
         return len(self._cache)
 
     def __contains__(self, text: str) -> bool:
-        return (
-            self.model_name,
-            text,
-        ) in self._cache
+        return (self.model_name, text) in self._cache
 
 
 def precompute_embeddings(
@@ -423,30 +231,13 @@ def precompute_embeddings(
     batch_size: int = 64,
     model_name: str | None = None,
 ) -> EmbeddingCache:
-    """Precompute a group of embeddings into a new cache."""
-    cache = EmbeddingCache(
-        model_name=model_name
-    )
-
-    cache.precompute(
-        texts,
-        batch_size=batch_size,
-        model_name=model_name,
-    )
-
+    """Convenience factory to precompute embeddings for a collection of texts into a new scoped cache."""
+    cache = EmbeddingCache(model_name=model_name)
+    cache.precompute(texts, batch_size=batch_size, model_name=model_name)
     return cache
 
 
-# ============================================================================
-# SINGLE EMBEDDING HELPERS
-# ============================================================================
-
-
-def generate_embedding(
-    text: str,
-    model_name: str | None = None,
-) -> list[float]:
-    """Generate one normalized embedding."""
+def generate_embedding(text: str, model_name: str | None = None) -> list[float]:
     if not text:
         return []
 
@@ -466,16 +257,11 @@ def semantic_similarity(
     embedding_cache: EmbeddingCache | None = None,
     model_name: str | None = None,
 ) -> float:
-    """Calculate cosine similarity between two descriptions."""
     if not left or not right:
         return 0.0
 
     if embedding_cache is not None:
-        return embedding_cache.similarity(
-            left,
-            right,
-            model_name=model_name,
-        )
+        return embedding_cache.similarity(left, right, model_name=model_name)
 
     model = get_embedding_model(model_name)
 
@@ -484,11 +270,6 @@ def semantic_similarity(
         normalize_embeddings=True,
     )
 
-    similarity = float(
-        embeddings[0] @ embeddings[1]
-    )
+    similarity = float(embeddings[0] @ embeddings[1])
 
-    return max(
-        0.0,
-        min(1.0, similarity),
-    )
+    return max(0.0, min(1.0, similarity))

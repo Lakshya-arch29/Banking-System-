@@ -1,4 +1,4 @@
-"""
+﻿"""
 Human review queue routes.
 
 GET  /api/v1/review/queue
@@ -42,7 +42,7 @@ def _is_reviewable(candidate: dict) -> bool:
     the human approval has already happened.
     """
     return (
-        candidate.get("ai_decision") in {
+        (candidate.get("ai_decision") or candidate.get("engine_decision")) in {
             "HIGH_CONFIDENCE",
             "REVIEW",
         }
@@ -178,7 +178,7 @@ def submit_review_action(
             "actor": actor_identity,
             "comments": request.reviewer_comments,
             "final_score": candidate.get("final_score"),
-            "timestamp": now,
+            "created_at": now,
         }
     )
 
@@ -205,19 +205,19 @@ def review_summary(
     review_candidates = [
         candidate
         for candidate in candidates
-        if candidate.get("ai_decision") == "REVIEW"
+        if (candidate.get("ai_decision") or candidate.get("engine_decision")) == "REVIEW"
     ]
 
     high_confidence_candidates = [
         candidate
         for candidate in candidates
-        if candidate.get("ai_decision") == "HIGH_CONFIDENCE"
+        if (candidate.get("ai_decision") or candidate.get("engine_decision")) == "HIGH_CONFIDENCE"
     ]
 
     reviewable_candidates = [
         candidate
         for candidate in candidates
-        if candidate.get("ai_decision") in {
+        if (candidate.get("ai_decision") or candidate.get("engine_decision")) in {
             "HIGH_CONFIDENCE",
             "REVIEW",
         }
@@ -250,3 +250,4 @@ def review_summary(
         "high_confidence": len(high_confidence_candidates),
         "review_recommendations": len(review_candidates),
     }
+
